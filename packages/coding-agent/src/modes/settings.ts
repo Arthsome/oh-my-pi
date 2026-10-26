@@ -578,14 +578,14 @@ effect(cfgTuiHyperlinks, applyHyperlinkSetting);
 export const cfgTuiMouse = register({
 	id: "tui.mouse",
 	type: "boolean",
-	default: false,
+	default: true,
 	ui: {
 		tab: "appearance",
 		group: "Display",
 		label: "Mouse Click-to-Focus",
 		get description() {
 			const shift = formatKeyHint("shift");
-			return `Capture mouse clicks in the main session so live subagent cards and HUD rows focus on click, with a hover highlight on the target, and clicks on extension-owned links reach their extension (the link-hint key picks them without the mouse). Native text selection becomes ${shift}+drag and wheel scroll becomes ${shift}+wheel while on`;
+			return `Capture mouse clicks in the main session so live subagent cards and HUD rows focus on click, with a hover highlight on the target. Wheel up hands the transcript to the terminal's native scrollback, pausing output so streaming does not pull the view down; any key returns. Native text selection becomes ${shift}+drag while on`;
 		},
 	},
 });

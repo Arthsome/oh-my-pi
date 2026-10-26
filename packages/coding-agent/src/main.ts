@@ -733,6 +733,9 @@ async function runInteractiveMode(
 		await logger.time("InteractiveMode.renderInitialMessages", () =>
 			mode.renderInitialMessages({ preserveExistingChat: true }),
 		);
+		// Resuming must not stream the whole ledger through native scrollback:
+		// archive it in the app viewport and open on the tail.
+		if (resuming) mode.startTranscriptAtTail();
 		// A resolved version check must not insert its banner into a partial transcript.
 		checkedVersionPromise.then(newVersion => {
 			if (!cfgStartupCheckUpdate.get(settings)) {

@@ -600,6 +600,10 @@ export interface Terminal {
 
 	// Write output to terminal
 	write(data: string): void;
+	/** Suppress ordinary output while native scrollback owns the view. */
+	setNativeScrollPaused?(paused: boolean): void;
+	/** Write a native-scrollback handoff sequence even while output is suppressed. */
+	writeNativeScrollControl?(data: string): void;
 
 	// Get terminal dimensions
 	get columns(): number;
@@ -971,6 +975,7 @@ export class ProcessTerminal implements Terminal {
 	#mode2031DebounceTimer?: Timer;
 	#windowsTerminalAppearancePollTimer?: Timer;
 	#progressActive = false;
+	#nativeScrollPaused = false;
 	// Ghostty and Monstar expire OSC 9;4 state without a heartbeat. Persistent hosts such
 	// as Windows Terminal restart their indeterminate animation on every write.
 	readonly #keepProgressAlive = TERMINAL.id === "ghostty" || TERMINAL.id === "monstar";
@@ -1111,6 +1116,7 @@ export class ProcessTerminal implements Terminal {
 		onDisconnect?: () => void,
 		options?: TerminalStartOptions,
 	): void {
+		this.#nativeScrollPaused = false;
 		this.#inputHandler = onInput;
 		this.#resizeHandler = onResize;
 		this.#disconnectHandler = onDisconnect;
@@ -2351,6 +2357,7 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	stop(): void {
+		this.#nativeScrollPaused = false;
 		// Suppress observer/timer callbacks before any teardown can yield or throw.
 		this.#active = false;
 		this.#inputDeferred = false;
@@ -2559,11 +2566,20 @@ export class ProcessTerminal implements Terminal {
 		}
 	}
 
-	write(data: string): void {
+	setNativeScrollPaused(paused: boolean): void {
+		this.#nativeScrollPaused = paused;
+	}
+
+	writeNativeScrollControl(data: string): void {
+		this.write(data, true);
+	}
+
+	write(data: string, nativeScrollControl = false): void {
+		if (this.#nativeScrollPaused && !nativeScrollControl) return;
 		// Hosts can reset bracketed paste (e.g. iTerm2's Terminal State toggle).
 		// Reassert it with existing output, never on a timer while idle.
 		if (data && this.#active && this.#rearmBracketedPaste) data = `\x1b[?2004h${data}`;
-		this.#safeWrite(data);
+		this.#safeWrite(data, nativeScrollControl);
 		if (this.#writeLogPath) {
 			try {
 				// Keep clipboard contents out of the debug log: record the payload's length only.
@@ -2579,7 +2595,8 @@ export class ProcessTerminal implements Terminal {
 		}
 	}
 
-	#safeWrite(data: string): void {
+	#safeWrite(data: string, nativeScrollControl = false): void {
+		if (this.#nativeScrollPaused && !nativeScrollControl) return;
 		if (this.#headless) return;
 		if (this.#dead) return;
 		// Skip control sequences when stdout isn't a TTY (piped output, tests, log

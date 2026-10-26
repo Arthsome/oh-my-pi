@@ -8696,6 +8696,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#uiHelpers.renderSessionContextIncrementally(sessionContext, options, renderChunk);
 	}
 
+	/**
+	 * Keep a resumed transcript in the app-managed viewport instead of retiring
+	 * it into native scrollback on the first frames. Startup calls this after
+	 * the replay commit; the archive is filled without terminal writes, so the
+	 * screen opens directly on the live tail.
+	 */
+	startTranscriptAtTail(): void {
+		this.composer.startAppScrollAtTail();
+	}
+
 	async renderInitialMessages(options?: {
 		preserveExistingChat?: boolean;
 		clearTerminalHistory?: boolean;

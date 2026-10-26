@@ -19,6 +19,10 @@ function makeHarness() {
 	const listeners: Array<(data: string) => { consume?: boolean; data?: string } | undefined> = [];
 	const focused: string[] = [];
 	let toggled = 0;
+	const scrolls: number[] = [];
+	let nativeScrolls = 0;
+	const scrollKeys: string[] = [];
+	let editor: Record<string, unknown>;
 	const ctx = {
 		ui: {
 			addInputListener: (fn: (data: string) => { consume?: boolean; data?: string } | undefined) => {
@@ -28,16 +32,20 @@ function makeHarness() {
 			hasOverlay: () => false,
 			requestRender: () => {},
 			addStartListener: () => {},
-			getFocused: () => undefined,
+			getFocused: () => editor,
+			beginNativeScroll: () => {
+				nativeScrolls++;
+				return true;
+			},
 		},
 		handlesBtwBranchKey: () => false,
-		editor: {
+		editor: (editor = {
 			getText: () => "",
 			setActionKeys: () => {},
 			setCustomKeyHandler: () => {},
 			clearCustomKeyHandlers: () => {},
 			spaceHold: new SpaceHoldGesture(() => {}),
-		},
+		}),
 		keybindings: KeybindingsManager.inMemory(),
 		settings,
 		dictationSpaceHold: () => undefined,
@@ -53,6 +61,18 @@ function makeHarness() {
 		togglePinnedHudExpanded: () => {
 			toggled++;
 		},
+		composer: {
+			setRunActive: () => {},
+			scrollApp: (delta: number) => {
+				scrolls.push(delta);
+				return true;
+			},
+			scrollAppKey: (data: string) => {
+				scrollKeys.push(data);
+				return data === `${ESC}[5~`;
+			},
+			endAppScroll: () => {},
+		},
 		showStatus: () => {},
 		setClickHoverId: () => {},
 	} as unknown as InteractiveModeContext;
@@ -62,8 +82,14 @@ function makeHarness() {
 		click: () => {
 			for (const listener of listeners) listener(EXPANDER_CLICK);
 		},
+		wheel: (report: string) => {
+			for (const listener of listeners) listener(report);
+		},
 		focused,
 		toggled: () => toggled,
+		scrolls,
+		scrollKeys,
+		nativeScrolls: () => nativeScrolls,
 	};
 }
 
@@ -98,5 +124,19 @@ describe("InputController click routing", () => {
 		h.click();
 		expect(h.toggled()).toBe(1);
 		expect(h.focused).toEqual([]);
+	});
+
+	it("routes wheel-up and wheel-down through app scroll, not native scroll", () => {
+		const h = makeHarness();
+		h.wheel(`${ESC}[<64;1;1M`);
+		h.wheel(`${ESC}[<65;1;1M`);
+		expect(h.scrolls).toEqual([-3, 3]);
+		expect(h.nativeScrolls()).toBe(0);
+	});
+
+	it("routes PageUp to the app transcript while the editor is focused", () => {
+		const h = makeHarness();
+		h.wheel(`${ESC}[5~`);
+		expect(h.scrollKeys).toEqual([`${ESC}[5~`]);
 	});
 });

@@ -1,4 +1,5 @@
 import { getComposerStyle } from "../components/composer/registry";
+import { matchesKey } from "../keys";
 import { Spacer } from "../components/spacer";
 import type { StatusLineComponent } from "../status-line/component";
 import { compositeLineAt } from "../render/composite";
@@ -19,6 +20,7 @@ import {
 	type ViewportSize,
 } from "../tui";
 import { wrapLiteralLine } from "../utils";
+import { ScrollView } from "../components/scroll-view";
 import type { NativeChild, NativeSurface, NativeSurfaceProvider } from "../native/node";
 import { sameItems } from "../native/memo";
 import { postmortem } from "@oh-my-pi/pi-utils";
@@ -358,6 +360,20 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	#started = false;
 	#stopped = false;
 	#transferred = false;
+	// App-managed main-view scrolling. While active, the terminal keeps
+	// painting a full frame whose transcript viewport is scrolled by us; the
+	// composer/status rows stay fixed at the bottom and live output keeps
+	// updating. Nothing is emitted to native scrollback on this path.
+	#appScrollView = new ScrollView([], { height: 1, scrollbar: "never" });
+	#appScrollActive = false;
+	#appScrollFollow = true;
+	#appScrollPendingDelta = 0;
+	#appScrollPendingPage = 0;
+	#appScrollSticky = false;
+	#appScrollStartAtTailRequested = false;
+	#appArchiveRows: string[] = [];
+	#appArchiveTranscript: TranscriptContainer | undefined;
+	#appArchiveBlockCount = 0;
 
 	constructor(options: ComposerOptions = {}) {
 		ensureThemeSync();
@@ -488,9 +504,38 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// rows are never painted twice.
 		const now = performance.now();
 		const frame: AnimationFrame = { now, tick: Math.floor(now / 80) };
+		const startAtTail = this.#appScrollStartAtTailRequested;
+		this.#appScrollStartAtTailRequested = false;
+		if (this.#appArchiveTranscript !== transcript) {
+			this.#resetAppScroll();
+			this.#appArchiveTranscript = transcript;
+		}
+		// A cleared/rewound transcript must not leave rows from the old session
+		// in the app archive. Retirement keeps the child list intact, so only a
+		// shrink can mean the document was reset.
+		const childCount = transcript.children.length;
+		if (childCount < this.#appArchiveBlockCount) this.#appArchiveRows = [];
+		this.#appArchiveBlockCount = childCount;
+		if (startAtTail) {
+			this.#appScrollActive = true;
+			this.#appScrollSticky = true;
+			this.#appScrollFollow = true;
+			this.#appScrollPendingDelta = 0;
+			this.#appScrollPendingPage = 0;
+		}
 		// Retirement measures the same live blocks the viewport lays out below;
 		// one open frame renders each of them once for both.
 		transcript.beginFrame(frame);
+		if (this.#appScrollActive) {
+			return this.#renderAppScrollFrame(transcript, {
+				width,
+				rows,
+				frame,
+				preRoots,
+				after,
+				afterSpans,
+			});
+		}
 		const history = this.#offerHistory(transcript, width, rows, preRoots.length + belowFloor);
 		const headerVisible = !this.#headerRetired && this.#offeredHistory?.source !== "header";
 		const headerRows = headerVisible ? this.#header.render(width) : [];
@@ -651,6 +696,100 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	}
 
 	/**
+	 * Compose the app-managed main view: archive rows plus the still-live tail,
+	 * scrolled by {@link ScrollView}, with every below-transcript root pinned.
+	 * No history is offered while this frame is active; the terminal is showing
+	 * a normal full frame, so its own scrollback never moves the composer.
+	 */
+	#renderAppScrollFrame(
+		transcript: TranscriptContainer,
+		context: {
+			width: number;
+			rows: number;
+			frame: AnimationFrame;
+			preRoots: readonly string[];
+			after: readonly string[];
+			afterSpans: readonly ViewportClickSpan[];
+		},
+	): TerminalFramePlan {
+		const { width, rows, frame, preRoots, after, afterSpans } = context;
+		if (this.#appScrollSticky && this.#appScrollFollow) {
+			// Absorb finalized blocks into the local archive without offering
+			// them to native scrollback. Capacity 0 commits under the normal
+			// retirement budget, so a resumed ledger and later turns arrive in
+			// bounded slices instead of blocking one frame on a full render.
+			const batch = transcript.peekFinalizedBatch(width, 0);
+			if (batch !== undefined && batch.kind !== "replay") {
+				this.#appArchiveRows.push(...batch.rows);
+				transcript.acknowledgeFinalizedBatch(batch.id);
+				this.ui.requestRender();
+			}
+		}
+		const headerVisible = !this.#headerRetired && this.#offeredHistory?.source !== "header";
+		const headerRows = headerVisible ? this.#header.render(width) : [];
+		const before = [...headerRows, ...preRoots];
+		// renderViewport is the un-emitted tail. Committed rows live in the
+		// archive, so combining the two gives one complete document without
+		// re-rendering the whole transcript on every tick.
+		const live = transcript.renderViewport(width, Number.MAX_SAFE_INTEGER, frame);
+		let archived: readonly string[];
+		const offered = this.#offeredHistory;
+		if (offered?.kind === "replay") archived = offered.rows;
+		else if (offered !== undefined) archived = [...this.#appArchiveRows, ...offered.rows];
+		else archived = this.#appArchiveRows;
+		const body: string[] = [...before, ...archived];
+		if (live.length > 0) {
+			const last = body.at(-1);
+			if (last !== undefined && last !== "") body.push("");
+		}
+		const liveBase = body.length;
+		body.push(...live);
+		const fixed = after.length > rows ? after.slice(after.length - rows) : after;
+		const height = Math.max(0, rows - fixed.length);
+		const scroll = this.#appScrollView;
+		// On activation the body is laid out first, then the pending gesture is
+		// applied against its real tail. Later frames preserve the offset (or
+		// follow the tail when the user scrolled back to it).
+		scroll.setHeight(height);
+		scroll.setFollowTail(true);
+		scroll.setLines(body);
+		scroll.setFollowTail(this.#appScrollFollow);
+		if (this.#appScrollPendingDelta !== 0) {
+			scroll.scroll(this.#appScrollPendingDelta);
+			this.#appScrollPendingDelta = 0;
+		}
+		if (this.#appScrollPendingPage !== 0) {
+			scroll.page(this.#appScrollPendingPage);
+			this.#appScrollPendingPage = 0;
+		}
+		const bodyRows = scroll.render(width);
+		const viewportLength = bodyRows.length + fixed.length;
+		const offset = scroll.getScrollOffset();
+		const spans: ViewportClickSpan[] = [];
+		const shiftBodySpan = (span: ViewportClickSpan, base: number): void => {
+			const start = base + span.start - offset;
+			const end = Math.min(base + span.end - offset, bodyRows.length);
+			const clamped = Math.max(0, start);
+			if (end > clamped) {
+				const skew = clamped - start;
+				spans.push({ start: clamped, end, candidates: (local: number) => span.candidates(local + skew) });
+			}
+		};
+		for (const span of transcript.getLastViewportSpans()) {
+			const ids = (span.component as Partial<{ getClickFocusAgentIds(): string[] }>).getClickFocusAgentIds?.();
+			if (!ids || ids.length === 0) continue;
+			shiftBodySpan({ start: span.start, end: span.end, candidates: () => ids }, liveBase);
+		}
+		for (const span of afterSpans) {
+			const start = bodyRows.length + span.start;
+			const end = Math.min(bodyRows.length + span.end, viewportLength);
+			if (end > start) spans.push({ start, end, candidates: span.candidates });
+		}
+		this.#lastClickSpans = spans;
+		return { viewport: this.#paintHoverBand([...bodyRows, ...fixed], spans) };
+	}
+
+	/**
 	 * Describe the whole surface for a TSP terminal. `main` is the flowing
 	 * document: the header (welcome, extras) and every transcript block as its
 	 * own component child. `dock` is the live chrome below the transcript in
@@ -766,6 +905,126 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		return routeViewportClick(this.#lastClickSpans, index);
 	}
 
+	/** Whether the main transcript is being scrolled by the app, not the terminal. */
+	get appScrollActive(): boolean {
+		return this.#appScrollActive;
+	}
+
+	/**
+	 * Scroll the main transcript by `delta` rows (negative is older). The first
+	 * upward scroll switches the composer into app-managed scrolling: the
+	 * terminal keeps its mouse tracking, live output keeps painting, and the
+	 * composer/status rows remain fixed. Downward scrolling at the tail exits
+	 * app scrolling so normal retirement can resume.
+	 */
+	scrollApp(delta: number): boolean {
+		if (!this.#started || this.#stopped) return false;
+		const step = Number.isFinite(delta) ? Math.trunc(delta) : 0;
+		if (step === 0) return this.#appScrollActive;
+		if (!this.#appScrollActive) {
+			if (step > 0) return false;
+			this.#appScrollActive = true;
+			this.#appScrollFollow = false;
+			this.#appScrollPendingDelta = step;
+			this.#appScrollPendingPage = 0;
+			this.ui.requestRender();
+			return true;
+		}
+		this.#appScrollFollow = false;
+		this.#appScrollView.scroll(step);
+		if (this.#appScrollView.getScrollOffset() >= this.#appScrollView.getMaxScrollOffset()) {
+			this.endAppScroll();
+			return true;
+		}
+		this.ui.requestRender();
+		return true;
+	}
+
+	/**
+	 * Start a resumed session at its live tail with the existing transcript in
+	 * the in-app archive. Without this the first frames retire the whole ledger
+	 * into native scrollback in budgeted batches, which visibly scrolls the
+	 * terminal from the oldest row to the newest before the prompt is usable.
+	 */
+	startAppScrollAtTail(): void {
+		if (!this.#started || this.#stopped) return;
+		this.#appScrollStartAtTailRequested = true;
+		this.ui.requestRender();
+	}
+
+	/**
+	 * Keyboard navigation for app scrolling. PageUp enters app scrolling;
+	 * PageDown/Home/End are consumed only while it is active, so ordinary
+	 * editor navigation is untouched at the tail.
+	 */
+	scrollAppKey(data: string): boolean {
+		if (!this.#started || this.#stopped) return false;
+		if (!this.#appScrollActive) {
+			if (!matchesKey(data, "pageUp")) return false;
+			this.#appScrollActive = true;
+			this.#appScrollFollow = false;
+			this.#appScrollPendingPage = -1;
+			this.ui.requestRender();
+			return true;
+		}
+		if (matchesKey(data, "pageUp") || matchesKey(data, "pageDown")) {
+			this.#appScrollFollow = false;
+			this.#appScrollView.page(matchesKey(data, "pageUp") ? -1 : 1);
+			this.ui.requestRender();
+			return true;
+		}
+		if (matchesKey(data, "home")) {
+			this.#appScrollFollow = false;
+			this.#appScrollView.scrollToTop();
+			this.ui.requestRender();
+			return true;
+		}
+		if (matchesKey(data, "end")) {
+			this.endAppScroll();
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Return to the live tail. A startup tail view is sticky: it keeps the
+	 * archived transcript in the app viewport after submit or End, because
+	 * leaving the mode would make the blocks that were never emitted to native
+	 * scrollback disappear from the screen. Explicit replays force the exit.
+	 */
+	endAppScroll(force = false): void {
+		this.#appScrollStartAtTailRequested = false;
+		if (!this.#appScrollActive) return;
+		if (this.#appScrollSticky && !force) {
+			this.#appScrollFollow = true;
+			this.#appScrollPendingDelta = 0;
+			this.#appScrollPendingPage = 0;
+			this.#appScrollView.scrollToBottom();
+			this.ui.requestRender();
+			return;
+		}
+		this.#appScrollSticky = false;
+		this.#appScrollActive = false;
+		this.#appScrollFollow = true;
+		this.#appScrollPendingDelta = 0;
+		this.#appScrollPendingPage = 0;
+		this.#appScrollView.setLines([]);
+		this.ui.requestRender();
+	}
+
+	#resetAppScroll(): void {
+		this.#appScrollStartAtTailRequested = false;
+		this.#appScrollSticky = false;
+		this.#appScrollActive = false;
+		this.#appScrollFollow = true;
+		this.#appScrollPendingDelta = 0;
+		this.#appScrollPendingPage = 0;
+		this.#appScrollView.setLines([]);
+		this.#appArchiveRows = [];
+		this.#appArchiveTranscript = undefined;
+		this.#appArchiveBlockCount = 0;
+	}
+
 	/**
 	 * The extension-owned link label drawn at cell `col` of a mutable-viewport line, or `undefined`.
 	 * Only links whose scheme an extension registered match; see `extensionLinkLabels`.
@@ -838,6 +1097,11 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	acknowledgeHistory(id: number): void {
 		const offered = this.#offeredHistory;
 		if (offered === undefined || offered.id !== id) return;
+		// Keep the rows the terminal has accepted. The app-scroll document is
+		// archive + the still-live tail: committed blocks disappear from
+		// renderViewport, so this is the only place their rows survive locally.
+		if (offered.kind === "replay") this.#appArchiveRows = [...offered.rows];
+		else this.#appArchiveRows.push(...offered.rows);
 		if (offered.source === "header") {
 			this.#headerRetired = true;
 			this.#retiredHeaderRows = offered.rows;
@@ -862,6 +1126,28 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		if (!this.#started || this.#stopped) return [];
 		const width = Math.max(1, viewport.columns);
 		const rows = Math.max(0, viewport.rows);
+		if (this.#appScrollActive && this.#runtimeMounted) {
+			const roots = [...this.#runtimeChildren, this.#statusHost];
+			const transcriptIndex = roots.findIndex(root => root instanceof TranscriptContainer);
+			if (transcriptIndex >= 0) {
+				const transcript = roots[transcriptIndex] as TranscriptContainer;
+				const preRoots = this.#renderRoots(roots.slice(0, transcriptIndex), width);
+				const after: string[] = [];
+				const afterSpans: ViewportClickSpan[] = [];
+				for (const root of roots.slice(transcriptIndex + 1)) this.#renderBelowRoot(root, width, after, afterSpans);
+				const now = performance.now();
+				const frame: AnimationFrame = { now, tick: Math.floor(now / 80) };
+				transcript.beginFrame(frame);
+				return this.#renderAppScrollFrame(transcript, {
+					width,
+					rows,
+					frame,
+					preRoots,
+					after,
+					afterSpans,
+				}).viewport;
+			}
+		}
 		const tail = this.#runtimeMounted
 			? this.#renderResizeTail(width, rows)
 			: this.#renderRoots([this.#bootstrapInputGap, this.editor, this.#statusHost], width);
@@ -881,6 +1167,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 
 	/** Replays committed presentation without changing logical retirement state. */
 	beginHistoryReplay(): void {
+		this.endAppScroll(true);
 		if (this.#offeredHistory !== undefined) {
 			this.#historyReplayRequested = true;
 			return;
@@ -890,6 +1177,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 
 	/** Forces every currently eligible finalized prefix to retire before stop. */
 	beginHistoryFlush(): void {
+		this.endAppScroll(true);
 		this.#historyFlush = true;
 		// A pending replay would re-render and re-stream the entire committed
 		// ledger during shutdown; the terminal already holds that history, so
@@ -1134,6 +1422,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// A TSP terminal keeps (and draws) what is typed until startup releases
 		// the held input, standing in for the kernel echo other terminals give.
 		this.#editor.nativeTypeahead = options.deferInput === true;
+		if (options.clearScrollback === true) this.#resetAppScroll();
 		this.ui.start({ clearScrollback: options.clearScrollback === true, deferInput: options.deferInput === true });
 		if (options.playWelcomeIntro !== false) this.playWelcomeIntro();
 		// Deferred input identifies the CLI prepaint handoff. Flush the queued
