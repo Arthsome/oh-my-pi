@@ -179,7 +179,7 @@ export interface AgentHubOpenOptions {
 export interface InteractiveModeContext {
 	// UI access
 	ui: TUI;
-	readonly composer: Pick<Composer, "setRunActive">;
+	readonly composer: Pick<Composer, "setRunActive" | "scrollApp" | "scrollAppKey" | "endAppScroll">;
 	chatContainer: TranscriptContainer;
 	/** `!`/`$` runs started while the agent streams, until {@link flushPendingBashComponents} moves them into the transcript. */
 	pendingShellContainer: Container;

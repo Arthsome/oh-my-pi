@@ -327,6 +327,7 @@ export class InputController {
 	#expandToolsListenerInstalled = false;
 	#inlineMouseListenerInstalled = false;
 	#linkHintListenerInstalled = false;
+	#appScrollKeyListenerInstalled = false;
 
 	/** Click-candidate id the hover band currently tracks; repaint only on change. */
 	#lastHoverClickId: string | undefined;
@@ -523,6 +524,16 @@ export class InputController {
 				}
 				this.toggleToolOutputExpansion();
 				return { consume: true };
+			});
+		}
+		if (!this.#appScrollKeyListenerInstalled) {
+			this.#appScrollKeyListenerInstalled = true;
+			// PageUp enters the app-managed transcript view; once there,
+			// PageDown/Home/End stay inside it. At the tail these keys fall
+			// through to the editor, so normal cursor/page navigation is intact.
+			this.ctx.ui.addInputListener(data => {
+				if (this.ctx.ui.hasOverlay() || this.ctx.ui.getFocused() !== this.ctx.editor) return undefined;
+				return this.ctx.composer?.scrollAppKey(data) ? { consume: true } : undefined;
 			});
 		}
 		if (!this.#inlineMouseListenerInstalled) {
@@ -874,10 +885,8 @@ export class InputController {
 	 * and HUD rows focus that agent in one action, and pointer motion lights up
 	 * the hover band on the target under the cursor. Every SGR report is consumed
 	 * while inline tracking owns the terminal so button/wheel bytes never reach
-	 * the editor as typed input; clicks on chrome simply swallow. Wheel ticks are
-	 * consumed the same way but cannot scroll: the terminal already chose to
-	 * report instead of scrolling, and no escape sequence moves its scrollback
-	 * viewport (#18458).
+	 * the editor as typed input; wheel-up releases capture for native scrollback.
+	 * Clicks on chrome simply swallow.
 	 */
 	#handleInlineMouse(data: string): { consume?: boolean; data?: string } | undefined {
 		if (!data.startsWith("\x1b[<")) return undefined;
@@ -885,6 +894,17 @@ export class InputController {
 		if (this.ctx.ui.hasOverlay()) return undefined;
 		const event = parseSgrMouse(data);
 		if (!event) return undefined;
+		if (event.wheel === -1) {
+			if (this.ctx.composer?.scrollApp(-3)) return { consume: true };
+			this.ctx.ui.beginNativeScroll();
+			return { consume: true };
+		}
+		if (event.wheel === 1) {
+			// The app viewport owns wheel-down while it is open. At the live
+			// tail this is a no-op rather than a native-scroll release.
+			this.ctx.composer?.scrollApp(3);
+			return { consume: true };
+		}
 		if (event.motion) this.#updateHoverHighlight(event.row);
 		else if (event.leftClick && !this.#activateClickedLink(event.row, event.col)) this.#focusClickedAgent(event.row);
 		return { consume: true };
@@ -1106,6 +1126,9 @@ export class InputController {
 
 	setupEditorSubmitHandler(): void {
 		const submit = async (text: string) => {
+			// Sending is a request to return to the live tail; the app-managed
+			// viewport must not keep the reply hidden above the composer.
+			this.ctx.composer?.endAppScroll();
 			const submittedText = text;
 			// The Editor resets before calling onSubmit, so this is normally empty;
 			// different editor text after an await below is a newer draft.

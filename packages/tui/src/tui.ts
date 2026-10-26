@@ -1088,6 +1088,12 @@ export class TUI extends Container {
 	// against the next one.
 	#altActive = false;
 	#mouseTracking: MouseTrackingState = "off";
+	/**
+	 * Native scrollback handoff: rendering is suspended and terminal mouse
+	 * capture is released so the wheel reaches the terminal's own scrollback.
+	 */
+	#nativeScrollPaused = false;
+	#nativeScrollResizePending = false;
 	/** Product-owned probe for opt-in normal-buffer click capture (`tui.mouse`). Read every frame. */
 	#inlineMouseProvider: (() => boolean) | undefined;
 	#altPreviousLines: string[] = [];
@@ -1472,18 +1478,54 @@ export class TUI extends Container {
 		this.#inlineMouseProvider = provider;
 	}
 
+	/**
+	 * Hand the main transcript to the terminal's native scrollback. Mouse
+	 * capture is released and rendering is held until {@link endNativeScroll},
+	 * so streaming output cannot pull the viewport back to the bottom while the
+	 * user is reading history. Returns `false` when a fullscreen overlay or the
+	 * native TSP surface owns the display.
+	 */
+	beginNativeScroll(): boolean {
+		if (this.#stopped) return false;
+		if (this.#nativeScrollPaused) return true;
+		if (this.#nativeLive || this.#altActive || this.#getTopmostVisibleOverlay() !== undefined) return false;
+		this.#nativeScrollPaused = true;
+		this.#renderTimer?.cancel();
+		this.#renderTimer = undefined;
+		this.#renderRequested = true;
+		this.#setMouseTracking("off");
+		this.terminal.setNativeScrollPaused?.(true);
+		return true;
+	}
+
+	/** Resume rendering and restore inline mouse capture after native scrolling. */
+	endNativeScroll(): void {
+		if (!this.#nativeScrollPaused) return;
+		this.terminal.setNativeScrollPaused?.(false);
+		const resized = this.#nativeScrollResizePending;
+		this.#nativeScrollPaused = false;
+		this.#nativeScrollResizePending = false;
+		if (resized) this.invalidate();
+		this.requestRender(true);
+	}
+
+	#writeNativeScrollControl(data: string): void {
+		if (this.terminal.writeNativeScrollControl) this.terminal.writeNativeScrollControl(data);
+		else this.terminal.write(data);
+	}
+
 	/** Transition mouse reporting, emitting only the sequences a change needs. */
 	#setMouseTracking(state: MouseTrackingState): void {
 		if (state === this.#mouseTracking) return;
 		const wasOff = this.#mouseTracking === "off";
 		this.#mouseTracking = state;
 		if (state === "off") {
-			if (!wasOff) this.terminal.write(MOUSE_TRACKING_OFF);
+			if (!wasOff) this.#writeNativeScrollControl(MOUSE_TRACKING_OFF);
 			return;
 		}
 		// Inline and fullscreen reporting are the same bytes: moving between
 		// live modes needs no emission, only entering from off does.
-		if (wasOff) this.terminal.write(MOUSE_TRACKING_ON);
+		if (wasOff) this.#writeNativeScrollControl(MOUSE_TRACKING_ON);
 	}
 
 	/** Check if an overlay entry is currently visible */
@@ -1549,6 +1591,8 @@ export class TUI extends Container {
 		this.#outputDrainWait = undefined;
 		this.#renderRequested = false;
 		this.#stopped = false;
+		this.terminal.setNativeScrollPaused?.(false);
+		this.#nativeScrollPaused = false;
 		this.#appearanceReportUnsubscribe?.();
 		let backgroundRgb: number | undefined;
 		let subscribed = true;
@@ -1650,6 +1694,10 @@ export class TUI extends Container {
 					// The terminal lays the surface out: a resize only refreshes the
 					// width `rows` fallback nodes render at. No replay.
 					this.#native!.noteTerminalColumns(this.terminal.columns);
+					return;
+				}
+				if (this.#nativeScrollPaused) {
+					this.#nativeScrollResizePending = true;
 					return;
 				}
 				if (this.#resizeProbe) {
@@ -2694,6 +2742,9 @@ export class TUI extends Container {
 		this.#outputDrainWait?.unsubscribe?.();
 		this.#outputDrainWait = undefined;
 		this.#renderRequested = false;
+		this.terminal.setNativeScrollPaused?.(false);
+		this.#nativeScrollPaused = false;
+		this.#nativeScrollResizePending = false;
 		this.#appearanceReportUnsubscribe?.();
 		this.#appearanceReportUnsubscribe = undefined;
 		this.#cancelPostmortemRestore?.();
@@ -2811,6 +2862,9 @@ export class TUI extends Container {
 	 */
 	resetDisplay(): void {
 		if (this.#stopped) return;
+		this.terminal.setNativeScrollPaused?.(false);
+		this.#nativeScrollPaused = false;
+		this.#nativeScrollResizePending = false;
 		this.invalidate();
 		this.#prepareForcedRender(true);
 		this.#renderRequested = false;
@@ -2819,6 +2873,17 @@ export class TUI extends Container {
 
 	requestRender(force = false, options?: RenderRequestOptions): void {
 		if (this.#stopped) return;
+		if (this.#nativeScrollPaused) {
+			if (options?.clearScrollback !== true) {
+				this.#renderRequested = true;
+				return;
+			}
+			// A destructive reset cannot be deferred behind native scrollback:
+			// it must wipe the history the user is reading before repainting.
+			this.terminal.setNativeScrollPaused?.(false);
+			this.#nativeScrollPaused = false;
+			this.#nativeScrollResizePending = false;
+		}
 		if (force) {
 			this.#prepareForcedRender(options?.clearScrollback === true);
 			this.#renderRequested = true;
@@ -2859,6 +2924,15 @@ export class TUI extends Container {
 	 */
 	renderNow(options?: RenderRequestOptions): void {
 		if (this.#stopped) return;
+		if (this.#nativeScrollPaused) {
+			if (options?.clearScrollback !== true) {
+				this.#renderRequested = true;
+				return;
+			}
+			this.terminal.setNativeScrollPaused?.(false);
+			this.#nativeScrollPaused = false;
+			this.#nativeScrollResizePending = false;
+		}
 		this.#prepareForcedRender(options?.clearScrollback === true);
 		this.#renderRequested = false;
 		this.#executeRender();
@@ -2877,6 +2951,10 @@ export class TUI extends Container {
 
 	/** Ordinary (non-forced) render scheduling. */
 	#requestOrdinaryRender(): void {
+		if (this.#nativeScrollPaused) {
+			this.#renderRequested = true;
+			return;
+		}
 		if (this.#renderRequested) return;
 		this.#renderRequested = true;
 		const session = this.#renderSession;
@@ -2933,6 +3011,7 @@ export class TUI extends Container {
 		if (this.#stopped || !this.#renderRequested) {
 			return;
 		}
+		if (this.#nativeScrollPaused) return;
 		this.#renderRequested = false;
 		this.#executeRender();
 		if (this.#renderRequested) {
@@ -2941,7 +3020,13 @@ export class TUI extends Container {
 	};
 
 	#scheduleRender(): void {
-		if (this.#stopped || this.#outputDrainWait || this.#renderTimer || !this.#renderRequested) {
+		if (
+			this.#stopped ||
+			this.#outputDrainWait ||
+			this.#nativeScrollPaused ||
+			this.#renderTimer ||
+			!this.#renderRequested
+		) {
 			return;
 		}
 		const now = this.#renderScheduler.now();
@@ -2973,6 +3058,10 @@ export class TUI extends Container {
 	 * reads it re-entrantly) and compute the cost once the paint returns.
 	 */
 	#executeRender(): void {
+		if (this.#nativeScrollPaused) {
+			this.#renderRequested = true;
+			return;
+		}
 		if (this.#deferRenderForOutputBacklog()) return;
 		this.#inputRenderPending = false;
 		const start = this.#renderScheduler.now();
@@ -3067,6 +3156,13 @@ export class TUI extends Container {
 		// cadence, not the ceiling. Input that triggers no render leaves the latch for the next frame
 		// to consume at the 30 fps floor once; harmless.
 		this.#inputRenderPending = true;
+
+		if (this.#nativeScrollPaused) {
+			// Mouse reports queued before capture was released belong to the
+			// scroll gesture; anything else is the user returning to the app.
+			if (data.startsWith("\x1b[<")) return;
+			this.endNativeScroll();
+		}
 
 		if (
 			this.#heldInput !== undefined &&

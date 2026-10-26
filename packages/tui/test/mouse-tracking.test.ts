@@ -16,6 +16,15 @@ class MinimalTerminal implements Terminal {
 	#onInput: ((data: string) => void) | undefined;
 	#onResize: (() => void) | undefined;
 	output = "";
+	#nativeScrollPaused = false;
+
+	setNativeScrollPaused(paused: boolean): void {
+		this.#nativeScrollPaused = paused;
+	}
+
+	writeNativeScrollControl(data: string): void {
+		this.output += data;
+	}
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
 		this.#onInput = onInput;
@@ -37,6 +46,7 @@ class MinimalTerminal implements Terminal {
 		this.#onResize?.();
 	}
 	write(data: string): void {
+		if (this.#nativeScrollPaused) return;
 		this.output += data;
 	}
 
@@ -151,6 +161,114 @@ describe("inline mouse tracking", () => {
 			tui.stop();
 
 			expect(terminal.output.includes(TRACKING_OFF)).toBe(true);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("hands the transcript to native scrollback without painting", async () => {
+		const enabled = { current: true };
+		const { terminal, tui } = makeInlineTui(enabled);
+		try {
+			tui.start();
+			tui.renderNow();
+			expect(terminal.output.includes(TRACKING_ON)).toBe(true);
+
+			expect(tui.beginNativeScroll()).toBe(true);
+			expect(terminal.output.lastIndexOf(TRACKING_OFF)).toBeGreaterThan(terminal.output.lastIndexOf(TRACKING_ON));
+			const pausedAt = terminal.output.length;
+
+			// Output/status updates must not repaint the viewport while the user
+			// is reading terminal scrollback, or new rows pull them back down.
+			tui.requestRender(true);
+			terminal.sendInput("\x1b[<64;1;1M");
+			await new Promise(resolve => setTimeout(resolve, 20));
+			expect(terminal.output.length).toBe(pausedAt);
+
+			// Any key returns to the app and re-arms inline mouse capture.
+			terminal.sendInput("x");
+			await new Promise(resolve => setTimeout(resolve, 20));
+			expect(terminal.output.lastIndexOf(TRACKING_ON)).toBeGreaterThan(terminal.output.lastIndexOf(TRACKING_OFF));
+			expect(terminal.output.length).toBeGreaterThan(pausedAt);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("drops ordinary terminal output while native scrollback owns the view", async () => {
+		const enabled = { current: true };
+		const { terminal, tui } = makeInlineTui(enabled);
+		try {
+			tui.start();
+			tui.renderNow();
+			expect(tui.beginNativeScroll()).toBe(true);
+			const pausedAt = terminal.output.length;
+
+			terminal.write("title/status\n");
+			tui.requestRender(true);
+			await new Promise(resolve => setTimeout(resolve, 20));
+			expect(terminal.output.length).toBe(pausedAt);
+
+			terminal.sendInput("x");
+			await new Promise(resolve => setTimeout(resolve, 20));
+			expect(terminal.output.lastIndexOf(TRACKING_ON)).toBeGreaterThan(terminal.output.lastIndexOf(TRACKING_OFF));
+			expect(terminal.output.length).toBeGreaterThan(pausedAt);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("keeps native scroll paused across a terminal resize", async () => {
+		const enabled = { current: true };
+		const { terminal, tui } = makeInlineTui(enabled);
+		try {
+			tui.start();
+			tui.renderNow();
+			expect(tui.beginNativeScroll()).toBe(true);
+			const pausedAt = terminal.output.length;
+			terminal.columns = 100;
+			terminal.rows = 30;
+			terminal.emitResize();
+			await new Promise(resolve => setTimeout(resolve, 20));
+			expect(terminal.output.length).toBe(pausedAt);
+
+			terminal.sendInput("x");
+			await new Promise(resolve => setTimeout(resolve, 20));
+			expect(terminal.output.lastIndexOf(TRACKING_ON)).toBeGreaterThan(terminal.output.lastIndexOf(TRACKING_OFF));
+			expect(terminal.output.length).toBeGreaterThan(pausedAt);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("resumes for a destructive synchronous repaint", () => {
+		const enabled = { current: true };
+		const { terminal, tui } = makeInlineTui(enabled);
+		try {
+			tui.start();
+			tui.renderNow();
+			expect(tui.beginNativeScroll()).toBe(true);
+			const pausedAt = terminal.output.length;
+
+			// A clear-scrollback repaint cannot be deferred behind the history it
+			// is about to erase; it must take the display back immediately.
+			tui.renderNow({ clearScrollback: true });
+			expect(terminal.output.length).toBeGreaterThan(pausedAt);
+			expect(terminal.output.lastIndexOf(TRACKING_ON)).toBeGreaterThan(terminal.output.lastIndexOf(TRACKING_OFF));
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("does not borrow the native scrollback while an overlay owns the display", () => {
+		const enabled = { current: true };
+		const { tui } = makeInlineTui(enabled);
+		try {
+			tui.start();
+			const overlay = tui.showOverlay(new StaticOverlay(), { fullscreen: true });
+			tui.renderNow();
+			expect(tui.beginNativeScroll()).toBe(false);
+			overlay.hide();
 		} finally {
 			tui.stop();
 		}

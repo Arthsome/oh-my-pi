@@ -14,16 +14,20 @@ const ESC = String.fromCharCode(27);
 // SGR click on viewport row 2 (1-based y=3): the pinned expander row when the
 // candidates below resolve it to the toggle sentinel.
 const EXPANDER_CLICK = `${ESC}[<0;5;3M`;
-// Wheel ticks on the same row: capture consumes them, and omp has no viewport
-// of its own to scroll (history lives in terminal scrollback), so they must not
-// reach click routing.
-const WHEEL_UP = `${ESC}[<64;5;3M`;
-const WHEEL_DOWN = `${ESC}[<65;5;3M`;
-
 function makeHarness() {
 	const listeners: Array<(data: string) => { consume?: boolean; data?: string } | undefined> = [];
 	const focused: string[] = [];
 	let toggled = 0;
+	const scrolls: number[] = [];
+	let nativeScrolls = 0;
+	const scrollKeys: string[] = [];
+	const editor = {
+		getText: () => "",
+		setActionKeys: () => {},
+		setCustomKeyHandler: () => {},
+		clearCustomKeyHandlers: () => {},
+		spaceHold: new SpaceHoldGesture(() => {}),
+	};
 	const ctx = {
 		ui: {
 			addInputListener: (fn: (data: string) => { consume?: boolean; data?: string } | undefined) => {
@@ -33,16 +37,14 @@ function makeHarness() {
 			hasOverlay: () => false,
 			requestRender: () => {},
 			addStartListener: () => {},
-			getFocused: () => undefined,
+			getFocused: () => editor,
+			beginNativeScroll: () => {
+				nativeScrolls++;
+				return true;
+			},
 		},
 		handlesBtwBranchKey: () => false,
-		editor: {
-			getText: () => "",
-			setActionKeys: () => {},
-			setCustomKeyHandler: () => {},
-			clearCustomKeyHandlers: () => {},
-			spaceHold: new SpaceHoldGesture(() => {}),
-		},
+		editor,
 		keybindings: KeybindingsManager.inMemory(),
 		settings,
 		dictationSpaceHold: () => undefined,
@@ -57,6 +59,18 @@ function makeHarness() {
 		},
 		togglePinnedHudExpanded: () => {
 			toggled++;
+		},
+		composer: {
+			setRunActive: () => {},
+			scrollApp: (delta: number) => {
+				scrolls.push(delta);
+				return true;
+			},
+			scrollAppKey: (data: string) => {
+				scrollKeys.push(data);
+				return data === `${ESC}[5~`;
+			},
+			endAppScroll: () => {},
 		},
 		showStatus: () => {},
 		setClickHoverId: () => {},
@@ -74,8 +88,14 @@ function makeHarness() {
 		click: () => {
 			send(EXPANDER_CLICK);
 		},
+		wheel: (report: string) => {
+			for (const listener of listeners) listener(report);
+		},
 		focused,
 		toggled: () => toggled,
+		scrolls,
+		scrollKeys,
+		nativeScrolls: () => nativeScrolls,
 	};
 }
 
@@ -112,20 +132,17 @@ describe("InputController click routing", () => {
 		expect(h.focused).toEqual([]);
 	});
 
-	it("consumes wheel ticks without scrolling or clicking", () => {
+	it("routes wheel-up and wheel-down through app scroll, not native scroll", () => {
 		const h = makeHarness();
-		expect(h.send(WHEEL_UP)).toEqual([WHEEL_UP]);
-		expect(h.send(WHEEL_DOWN)).toEqual([WHEEL_DOWN]);
-		// Consumed *and* inert: capture owns the terminal's wheel, and omp has no
-		// viewport of its own to scroll (history lives in terminal scrollback).
-		expect(h.toggled()).toBe(0);
-		expect(h.focused).toEqual([]);
+		h.wheel(`${ESC}[<64;1;1M`);
+		h.wheel(`${ESC}[<65;1;1M`);
+		expect(h.scrolls).toEqual([-3, 3]);
+		expect(h.nativeScrolls()).toBe(0);
 	});
 
-	it("leaves wheel ticks unclaimed with capture off", () => {
-		cfgTuiMouse.set(settings, false);
+	it("routes PageUp to the app transcript while the editor is focused", () => {
 		const h = makeHarness();
-		expect(h.send(WHEEL_UP)).toEqual([]);
-		expect(h.toggled()).toBe(0);
+		h.wheel(`${ESC}[5~`);
+		expect(h.scrollKeys).toEqual([`${ESC}[5~`]);
 	});
 });
