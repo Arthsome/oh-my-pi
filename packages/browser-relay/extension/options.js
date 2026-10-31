@@ -1,21 +1,25 @@
 // Options page for the OMP Browser Relay extension (plain JS: shipped as-is).
+const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9224;
+const hostInput = document.getElementById("host");
 const portInput = document.getElementById("port");
 const tokenInput = document.getElementById("token");
 const status = document.getElementById("status");
 
-chrome.storage.local.get({ port: DEFAULT_PORT, token: "" }).then(stored => {
+chrome.storage.local.get({ host: DEFAULT_HOST, port: DEFAULT_PORT, token: "" }).then(stored => {
+	hostInput.value = String(stored.host || DEFAULT_HOST);
 	portInput.value = String(stored.port);
 	tokenInput.value = String(stored.token);
 });
 
 document.getElementById("save").addEventListener("click", async () => {
+	const host = hostInput.value.trim() || DEFAULT_HOST;
 	const port = Number(portInput.value);
 	if (!Number.isInteger(port) || port <= 0 || port > 65535) {
 		status.textContent = "invalid port";
 		return;
 	}
-	await chrome.storage.local.set({ port, token: tokenInput.value });
+	await chrome.storage.local.set({ host, port, token: tokenInput.value });
 	status.textContent = "saved";
 	setTimeout(() => {
 		status.textContent = "";

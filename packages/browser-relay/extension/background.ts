@@ -17,6 +17,7 @@ import {
 } from "../../coding-agent/src/tools/browser/relay/protocol";
 import { ownedDebuggerTabs } from "./debugger-ownership";
 
+const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 9224;
 const PING_INTERVAL_MS = 20_000;
 const RECONNECT_MIN_MS = 1_000;
@@ -73,14 +74,17 @@ function ensureBrowserSession(): Promise<string> {
 }
 
 interface RelaySettings {
+	host: string;
 	port: number;
 	token: string;
 }
 
 async function loadSettings(): Promise<RelaySettings> {
-	const stored = await chrome.storage.local.get({ port: DEFAULT_PORT, token: "" });
+	const stored = await chrome.storage.local.get({ host: DEFAULT_HOST, port: DEFAULT_PORT, token: "" });
 	const port = Number(stored.port);
+	const host = typeof stored.host === "string" && stored.host.trim() ? stored.host.trim() : DEFAULT_HOST;
 	return {
+		host,
 		port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : DEFAULT_PORT,
 		token: typeof stored.token === "string" ? stored.token : "",
 	};
@@ -306,7 +310,7 @@ function scheduleReconnect(): void {
 async function connect(): Promise<void> {
 	if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 	const settings = await loadSettings();
-	const url = `ws://127.0.0.1:${settings.port}/ext${settings.token ? `?token=${encodeURIComponent(settings.token)}` : ""}`;
+  const url = `ws://${settings.host}:${settings.port}/ext${settings.token ? `?token=${encodeURIComponent(settings.token)}` : ""}`;
 	const socket = new WebSocket(url);
 	ws = socket;
 	socket.onopen = () => {

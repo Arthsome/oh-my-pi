@@ -13,6 +13,9 @@
 ### Added
 
 - The extension reports the omp version that installed it, and reloads itself when the relay updates its files after an omp upgrade ([#15105](https://github.com/can1357/oh-my-pi/pull/15105) by [@will-bogusz](https://github.com/will-bogusz))
+### Added
+
+- Configurable relay host in the extension (options page field, persisted in `chrome.storage.local`); default is `127.0.0.1` for local use, change to a tailnet IP or remote address for cross-device access.
 
 ## [18.12.2] - 2026-10-18
 

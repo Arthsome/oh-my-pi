@@ -17,6 +17,7 @@ async function ownedDebuggerTabs(targets, probe) {
 }
 
 // extension/background.ts
+var DEFAULT_HOST = "127.0.0.1";
 var DEFAULT_PORT = 9224;
 var PING_INTERVAL_MS = 20000;
 var RECONNECT_MIN_MS = 1000;
@@ -53,9 +54,11 @@ function ensureBrowserSession() {
   return browserSession;
 }
 async function loadSettings() {
-  const stored = await chrome.storage.local.get({ port: DEFAULT_PORT, token: "" });
+  const stored = await chrome.storage.local.get({ host: DEFAULT_HOST, port: DEFAULT_PORT, token: "" });
   const port = Number(stored.port);
+  const host = typeof stored.host === "string" && stored.host.trim() ? stored.host.trim() : DEFAULT_HOST;
   return {
+    host,
     port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : DEFAULT_PORT,
     token: typeof stored.token === "string" ? stored.token : ""
   };
@@ -252,7 +255,7 @@ async function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))
     return;
   const settings = await loadSettings();
-  const url = `ws://127.0.0.1:${settings.port}/ext${settings.token ? `?token=${encodeURIComponent(settings.token)}` : ""}`;
+  const url = `ws://${settings.host}:${settings.port}/ext${settings.token ? `?token=${encodeURIComponent(settings.token)}` : ""}`;
   const socket = new WebSocket(url);
   ws = socket;
   socket.onopen = () => {
