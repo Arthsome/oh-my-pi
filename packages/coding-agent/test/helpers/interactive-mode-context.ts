@@ -225,7 +225,6 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 	const ctx = {
 		ui,
 		composer: {
-			setRunActive: vi.fn(),
 			scrollApp: vi.fn(() => false),
 			scrollAppKey: vi.fn(() => false),
 			endAppScroll: vi.fn(),
@@ -297,6 +296,7 @@ export function createInteractiveModeContext(overrides: ContextOverrides = {}): 
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 		showWarning: vi.fn(),
+		showModelCycleTrack: vi.fn(),
 		showPinnedError: vi.fn(),
 		clearPinnedError: vi.fn(),
 		showHookInput: vi.fn(async () => undefined),
